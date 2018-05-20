@@ -1,0 +1,1015 @@
+*/
+#include <PinChangeInt.h>
+#include "PID.h"
+#include "DEFINITIONS.h"
+
+//#define RS485_TX 12
+//#define RS485_RX 13
+//#define RS485_DIR 11
+#define MAVI_LED 9
+#define KIRMIZI_LED 10
+#define SW1 4
+#define SW2 7
+#define SW3 8
+#define SW4 A2
+#define SW5 A3
+#define R_IS A4   //Sağ half bridge akım ölçümü için analog giriş pini
+#define L_IS A5   //Sol half bridge akım ölçümü için analog giriş pini
+#define L_PWM 5   //Sol PWM
+#define R_PWM 6   //Sağ PWM
+#define LIM_SW A0
+#define HOME_SW A1
+#define FEEDBACK_POT A7
+#define REF_POT A6
+#define encPinA 2     //If you change enc pins, you have to change the codes in the corresponding isr
+#define encPinB 3
+
+#define LOG_SIZE_MAX 200    //Pozisyon, Hız, Akım gibi ölçümlerin kaydını tutmak için maksimum örnek sayısı
+
+#define LOG_POSITION 0      //Pozisyon kaydı tutmak      
+#define LOG_CURRENT 1       //Akım kaydı tutmak
+
+//defns for the state of the driver
+#define DISABLED 0      //Sürücü pasif
+#define ENABLED 1       //Sürücü aktif
+
+volatile long encoderPosition = 0;
+long posRef = 0;
+long currentPosition;     //şu andaki enkoder pozisyon verisi
+long prevPosition = 0;    //bir önceki örnekte alınan enkoder pozisyon verisi
+float currentVel;         //Hız filtresinin çıkışı (Filtrelenmiş Hız bilgisi)
+float prevVel = 0;        //bir önceki örnekte alınan hız verisi
+float velFilterInput;     //şu andaki hız verisi (Hız filtresinin girişi)
+float velRef = 0;         //Hız referansı
+long profPosRelRef = 0;   //Profil Pozisyon Kontrolü için Relatif Referans değeri
+//long profPosAbsRef = 0;
+int currentForce;
+int forceRef = 0;
+
+boolean logEnable = false;  //Log tutulsun mu?
+boolean logWhat = LOG_POSITION; //Neyin logu tutulsun
+boolean sendLogToMatlab = false;  //Logu Matlab'a göndermek için kaldırılan bayrak
+unsigned int logCounter = 0;    //Log sayacı
+unsigned int logSize = LOG_SIZE_MAX;  //Pozisyon, Hız, Akım gibi ölçümlerin kaydını tutmak için şu anda kullanılan örnek sayısı, isteğe bağlı giriş
+unsigned long logForMatlab[LOG_SIZE_MAX]; //Matlab için kayıt tutan dizi
+
+unsigned long currentTime;    //Şimdiki zaman
+unsigned long oldTime = 0;    //PID algoritmasının bir önceki çalıştığı zaman
+unsigned long deltaT;         //Aralarındaki fark
+byte loopRate = 3;    //delta t for PID calc. in ms
+
+unsigned int printTick = 0;   //seri porttan bilgileri yazdırma zamanı için kullanılan sayaç
+boolean longReportPos = false;  //Uzun pozisyon raporu
+boolean longReportVel = false;  //Uzun hız raporu
+boolean shortReportPos = false; //Kısa pozisyon raporu
+boolean shortReportVel = false; //Kısa hız raporu
+boolean longReportForce = false; //Uzun kuvvet raporu
+
+#define MAX_SERIAL_FLOAT_DATA 5 //Seri porttan gelebilecek float bilginin sayısının üst limiti
+float serialFloatData[MAX_SERIAL_FLOAT_DATA]; //Seri porttan gelen mesajdan üretilen float bilgiyi tutan dizi
+int serialFloatIndex = 0;   //Yukarıdaki dizinin indisi
+
+int rIs;    //Sağ half bridge ham akım ölçümü (0-1023)
+int lIs;    //Sol half bridge ham akım ölçümü (0-1023)
+float rIsFloat; //Sağ half bridge akım ölçümü (Birimi Amper)
+float lIsFloat; //Sol half bridge akım ölçümü (Birimi Amper)
+float totalCurrent; //Motordan geçen akım (Birimi Amper)
+
+PID posPID(0.05, 0.01, 0.0);    //Pozisyon PID'si (kP, kI, kD)
+//PID posPID(4.0, 5.0, 0.05);   //Pozisyon PID'si (kP, kI, kD)
+PID velPID(0.03, 0.05, 0.0);    //Hız PID'si (kP, kI, kD)
+PID forcePID(.1, 0.0, .01);
+
+boolean userPosDir = false;     //Kullanıcı motorun pozitif dönüş yönünü bu bayrak ile değiştirebiliyor (Enkoder A,B değişimi gibi)
+boolean motorDir = false;       //Kullanıcı motora pozitif voltaj verdiğinde motor hangi yöne dönecek, bu bayrak ile değiştirebiliyor
+// (Motor bağlantı kablolarının değişimi gibi)
+
+float u = 0;          //Motora uygulancak giriş (-255 - 255 aralığında sınırlanıyor)
+float uManual = 0;    //Manuel mod için motora uygulancak giriş (-255 - 255 aralığında sınırlanıyor)
+
+long printingPeriod = 1000;   //Seri porttan rapor yazdırma sıklığı default: 1000 ms
+
+float coeff[4];   //5. dereceden pozisyon profil polinomunun katsayıları (coeff[0])
+//coeff[0] * t^5 + coeff[1] * t^4 + coeff[2] * t^3 + coeff[3] * t^0;
+unsigned long profInitialTime;  //Pozisyon profili başlangıç zamanı
+long profInitialPos;            //Pozisyon profili başlangıç pozisyonu
+long profFinalPos;              //Pozisyon profili bitiş pozisyonu
+float profTimeInSec = 0;        //Pozisyon profili toplam zamanı
+float relTime;                  //Pozisyon profili bağıl zamanı (Şimdiki zaman - Pozisyon profili başlangıç zamanı)
+boolean profPositionModeFired = false;  //Profil Pozisyon Hareketini tetikleme bayrağı
+#define MAX_PROF_ACCEL 80000.0  //Enc pulse per second square
+#define MAX_PROF_VEL 26000.0    //Enc pulse per second
+
+boolean driverState = DISABLED; //Sürücünün durumu (güç verildiğinde pasif)
+
+int operatingMode = MANUAL_MODE;  //Sürücünün çalışma modu (güç verildiğinde manuel modda)
+
+int serialDataAvailable = 0;    //Seri porttan veri geldiğini belirtir bayrak
+
+unsigned short int rs485id = 0; //Sürücü ID'si default 0 (setupta DIP Switch'ten okunarak güncelleniyor)
+
+void setup (void)
+{
+
+  //Home and Limit Switch Inputs
+  pinMode(HOME_SW, INPUT);
+  pinMode(LIM_SW, INPUT);
+
+  //Analog Inputs for Reference and Feedback Pots if Available
+  pinMode(REF_POT, INPUT);
+  pinMode(FEEDBACK_POT, INPUT);
+
+  //Analog Inputs for Current Measurements
+  pinMode(R_IS, INPUT);
+  pinMode(L_IS, INPUT);
+
+  // LED Test
+  pinMode(MAVI_LED, OUTPUT);
+  pinMode(KIRMIZI_LED, OUTPUT);
+
+  digitalWrite(MAVI_LED, HIGH);
+  delay(300);
+  digitalWrite(MAVI_LED, LOW);
+
+  digitalWrite(KIRMIZI_LED, HIGH);
+  delay(300);
+  digitalWrite(KIRMIZI_LED, LOW);
+
+  //Serial Port Settings
+  Serial.begin (115200);
+  Serial.setTimeout(100);   //Seri haberleşmede parse komutu için bir zaman aşımıdır (100 ms)
+
+  //ID Switches
+  pinMode(SW1, INPUT);
+  pinMode(SW2, INPUT);
+  pinMode(SW3, INPUT);
+  pinMode(SW4, INPUT);
+  pinMode(SW5, INPUT);
+
+  //Reading Driver ID Switches (SW5 -> MSB, SW1 -> LSB)
+  rs485id = digitalRead(SW5) * 16 + digitalRead(SW4) * 8 + digitalRead(SW3) * 4 + digitalRead(SW2) * 2 + digitalRead(SW1);
+
+  Serial.print(rs485id);
+  Serial.println("!");
+
+  //Pullups are enabled for Encoder Inputs to prevent miscountings
+  pinMode(encPinA, INPUT_PULLUP);
+  pinMode(encPinB, INPUT_PULLUP);
+
+  //Interrupt Settings for pin change
+  attachPinChangeInterrupt(encPinA, isrForEncPinA, CHANGE);
+  attachPinChangeInterrupt(encPinB, isrForEncPinB, CHANGE);
+
+  //  motor pwm pinleri
+  digitalWrite(L_PWM, LOW);
+  pinMode(L_PWM, OUTPUT);
+  digitalWrite(R_PWM, LOW);
+  pinMode(R_PWM, OUTPUT);
+
+}  // end of setup
+
+void loop (void)
+{
+  currentTime = millis();   //Şimdiki zaman
+  deltaT = currentTime - oldTime; //Şimdiki zaman - Bir önceki PID çalıştırılma zamanı
+  if (deltaT >= loopRate) //deltaT loopRate'den büyük veya eşitse PID çalıştırılır
+  {
+
+    oldTime = currentTime;
+    printTick++;
+
+    //------------------
+    //Current Measurement
+
+    rIs = analogRead(R_IS); //akım ham değerleri şimdi okunuyor 0-1023
+    lIs = analogRead(L_IS); //
+
+    rIsFloat = rIs / 1023.0 * 5.0 * 8.5;  //Amper birimine çevriliyor
+    lIsFloat = lIs / 1023.0 * 5.0 * 8.5;
+    totalCurrent = rIsFloat - lIsFloat;   //Motor akımı pozitif bir yön seçilmiş olarak hesaplanıyor
+
+    //-----------------
+
+    //Position Measurement
+    currentPosition = getEncoderPosition();
+
+    //Velocity Measurement //Türev alınıyor
+    velFilterInput = (float)(currentPosition - prevPosition) / (float)deltaT * 1000;  //encPulse per second
+    prevPosition = currentPosition;
+
+    //velocity filtering
+    float alpha = 0.2;
+    currentVel = alpha * velFilterInput + (1 - alpha) * prevVel;
+    prevVel = currentVel;
+    //currentVel filtre çıkışı
+
+    currentForce = analogRead(FEEDBACK_POT);
+
+    if (driverState == ENABLED) {     //sürücü aktif ise
+      switch (operatingMode)          //sürücü hangi çalışma modunda ona göre bir u seçiliyor
+      {
+        case MANUAL_MODE:   //elle sürüş
+          u = uManual;
+          break;
+        case POSITION_MODE: //pozisyon kontrol
+          u = posPID.compute((float)(posRef - currentPosition), (float) deltaT);  //PID hesaplama fonksiyonu çağrılıyor
+          break;
+        case PROFILE_POSITION_MODE :  //profilli pozisyon kontrol modu
+          if (profPositionModeFired)  //tetiklenmiş mi?
+          {
+            relTime = (float)currentTime - (float)profInitialTime;  //relativeTime
+            if (relTime < profTimeInSec * 1000)
+              posRef = evalPos(coeff, relTime / 1000); //pozisyon polinomunu relTime (relativeTime) için hesapla
+            else
+            { //profil bitmiş demektir
+              profPositionModeFired = false;  //tetiği durdur
+              posRef = profFinalPos;          // :) çakallık
+              Serial.println("!");            //bittiğine dair seri porttan ! karakteri gönderir
+            }
+          }
+          u = posPID.compute((float)(posRef - currentPosition), (float) deltaT);  //PID hesaplama fonksiyonu çağrılıyor
+          break;
+        case VELOCITY_MODE:
+          u = velPID.compute(velRef - currentVel, (float) deltaT);      //PID hesaplama fonksiyonu çağrılıyor
+          break;
+        case PROFILE_VELOCITY_MODE:
+          //Do nothing
+          break;
+        case CURRENT_MODE:
+          //Do nothing
+          break;
+        case HOMING_MODE:
+          //Do nothing
+          break;
+        case FORCE_MODE:
+          if (currentForce < 30)
+            u = 75;
+          else
+            u = forcePID.compute((float)(forceRef - currentForce), (float) deltaT);  //PID hesaplama fonksiyonu çağrılıyor
+          break;
+      }
+    }
+    else
+    {
+      u = 0;      //sürücü pasif ise u sıfır alınır
+    }
+
+    uToPWM(u);    //motora uygulanacak [-255,255] aralığındaki u girişi için yön ve PWM değerleri ayarlanır
+
+    if (logEnable)  //Eğer kayıt yetkilendirilmişse
+    {
+      switch (logWhat)  //neyin kaydedileceğine bakılıyor
+      {
+        case LOG_POSITION:
+          logForMatlab[logCounter] = (unsigned long)getEncoderPosition();
+          break;
+        case LOG_CURRENT:
+          unsigned long tempHex = *(unsigned long *)&totalCurrent;
+          logForMatlab[logCounter] = tempHex;
+          break;
+      }
+      if (++logCounter == logSize)
+      {
+        logEnable = false;
+        logCounter = 0;
+      }
+    }
+  }
+
+  if (printTick >= (printingPeriod / loopRate))  //printing period default 1000 ms
+  {
+    printTick = 0;
+
+    if (longReportVel)
+    {
+      Serial.print("ID ");
+      Serial.print(rs485id);
+      Serial.print(" opMode ");
+      Serial.print(operatingMode);
+      Serial.print(" driverState ");
+      Serial.print(driverState);
+      Serial.print(" velRef ");
+      Serial.print(velRef);
+      Serial.print(" vel ");
+      Serial.print(currentVel);
+      Serial.print(" error ");
+      Serial.print(velRef - currentVel);
+      Serial.print(" u_p ");
+      Serial.print(velPID.getUp());
+      Serial.print(" u_i ");
+      Serial.print(velPID.getUi());
+      Serial.print(" u_d ");
+      Serial.print(velPID.getUd());
+      Serial.print(" u ");
+      Serial.print(velPID.getU());
+      Serial.print(" uManual ");
+      Serial.print(uManual);
+      Serial.print(" deltaT ");
+      Serial.print(deltaT);
+      Serial.print(" Kp ");
+      Serial.print(velPID.getKp());
+      Serial.print(" Ki ");
+      Serial.print(velPID.getKi());
+      Serial.print(" Kd ");
+      Serial.println(velPID.getKd());
+    }
+
+    if (longReportPos)
+    {
+      Serial.print("ID ");
+      Serial.print(rs485id);
+      Serial.print(" opMode ");
+      Serial.print(operatingMode);
+      Serial.print(" driverState ");
+      Serial.print(driverState);
+      Serial.print(" posRef ");
+      Serial.print(posRef);
+      Serial.print(" pos ");
+      Serial.print(getEncoderPosition());
+      Serial.print(" error ");
+      Serial.print(posRef - getEncoderPosition());
+      Serial.print(" u_p ");
+      Serial.print(posPID.getUp());
+      Serial.print(" u_i ");
+      Serial.print(posPID.getUi());
+      Serial.print(" u_d ");
+      Serial.print(posPID.getUd());
+      Serial.print(" u ");
+      Serial.print(posPID.getU());
+      Serial.print(" uManual ");
+      Serial.print(uManual);
+      Serial.print(" deltaT ");
+      Serial.print(deltaT);
+      Serial.print(" Kp ");
+      Serial.print(posPID.getKp());
+      Serial.print(" Ki ");
+      Serial.print(posPID.getKi());
+      Serial.print(" Kd ");
+      Serial.println(posPID.getKd());
+    }
+
+    if (longReportForce)
+    {
+      Serial.print("ID ");
+      Serial.print(rs485id);
+      Serial.print(" opMode ");
+      Serial.print(operatingMode);
+      Serial.print(" driverState ");
+      Serial.print(driverState);
+      Serial.print(" forceRef ");
+      Serial.print(forceRef);
+      Serial.print(" force ");
+      Serial.print(currentForce);
+      Serial.print(" error ");
+      Serial.print(forceRef - currentForce);
+      Serial.print(" u_p ");
+      Serial.print(forcePID.getUp());
+      Serial.print(" u_i ");
+      Serial.print(forcePID.getUi());
+      Serial.print(" u_d ");
+      Serial.print(forcePID.getUd());
+      Serial.print(" u ");
+      Serial.print(forcePID.getU());
+      Serial.print(" uManual ");
+      Serial.print(uManual);
+      Serial.print(" deltaT ");
+      Serial.print(deltaT);
+      Serial.print(" Kp ");
+      Serial.print(forcePID.getKp());
+      Serial.print(" Ki ");
+      Serial.print(forcePID.getKi());
+      Serial.print(" Kd ");
+      Serial.println(forcePID.getKd());
+    }
+
+    if (shortReportPos)
+    {
+      Serial.print("ID ");
+      Serial.print(rs485id);
+      Serial.print(" opMode ");
+      Serial.print(operatingMode);
+      Serial.print(" driverState ");
+      Serial.print(driverState);
+      Serial.print(" pos ");
+      Serial.print(getEncoderPosition());
+      Serial.print(" current ");
+      Serial.println(totalCurrent);
+    }
+
+    if (shortReportVel)
+    {
+      Serial.print("ID ");
+      Serial.print(rs485id);
+      Serial.print(" opMode ");
+      Serial.print(operatingMode);
+      Serial.print(" driverState ");
+      Serial.print(driverState);
+      Serial.print(" vel ");
+      Serial.print(currentVel);
+      Serial.print(" current ");
+      Serial.println(totalCurrent);
+    }
+
+  }
+
+  if (sendLogToMatlab)
+  {
+    sendLogToMatlab = false;
+
+    for (int j = 0; j < logSize; j++)
+    {
+      Serial.write(logForMatlab[j]);  //dört bytelık bilgi sırayla kaydırılarak gönderiliyor
+      Serial.write(logForMatlab[j] >> 8);
+      Serial.write(logForMatlab[j] >> 16);
+      Serial.write(logForMatlab[j] >> 24);
+    }
+  }
+
+  while (Serial.available() > 0)  //Seri port bufferında bilgi varmı
+  {
+    serialFloatData[serialFloatIndex++] = Serial.parseFloat();//varsa bufferdan bir tane float al
+    int dummy = Serial.read();//sıradaki karakteri al, ya boşluk, ya \n yada \r olabilir
+    if (dummy == '\n' || dummy == '\r')
+    {
+      if (Serial.available() > 0)         //hem \n hemde \r gönderildiyse bu koşul sağlanır
+        dummy = Serial.read();
+      serialDataAvailable = 1;
+    }
+  }
+
+  if (serialDataAvailable)          //Gerekli bilgiler float olarak alındıysa
+  {
+    if (((char)serialFloatData[0]) == rs485id)//serialFloatData[0] mesajın ilk floatıdır. Normal şartlarda bu sürücünün ID'si olmalıdır.
+    {
+      switch ((int) serialFloatData[1])       //serialFloatData[1] komuttur detaylar DEFINITIONS.h dosyasındadır.
+      {
+        case COM_SET_DRIVER_STATE:            //sürücü durumunu değştirir
+          if (serialFloatIndex == 3)          //her komutun gerektirdiği float sayısı var. örneğin bu komut için sayı 3.
+          { // ID COMMAND OPERAND1 OPERAND2 OPERAND3 ...
+            switch ((int)serialFloatData[2])  //serialFloatData[2] burada ya 0 yada 1 olmalıdır
+            {
+              case 0://disable driver
+                driverState = DISABLED;
+                uManual = 0;
+                operatingMode = MANUAL_MODE;
+                profPositionModeFired = false;
+                digitalWrite(KIRMIZI_LED, LOW);
+                digitalWrite(MAVI_LED, LOW);
+                break;
+              case 1://enable driver
+                uManual = 0;
+                operatingMode = MANUAL_MODE;
+                profPositionModeFired = false;
+                driverState = ENABLED;
+                digitalWrite(KIRMIZI_LED, HIGH);
+                break;
+            }
+          }
+          break;
+        case COM_SET_OPERATING_MODE:    //sürücü çalışma modu burada değiştirilir
+          if (serialFloatIndex == 3)
+          {
+            uManual = 0;
+            switch ((int)serialFloatData[2])  //0 1 2 yani 3. float bu komutun operandı
+            {
+              case MANUAL_MODE:
+                operatingMode = MANUAL_MODE;
+                posPID.disablePID();
+                velPID.disablePID();
+                forcePID.disablePID();
+                break;
+              case POSITION_MODE:
+                operatingMode = POSITION_MODE;
+                posRef = getEncoderPosition();    //çalışma modunu pozisyon moduna alınca o andaki pozisyon referans olarak alınır.
+                posPID.enablePID();
+                velPID.disablePID();
+                forcePID.disablePID();
+                digitalWrite(MAVI_LED, HIGH);
+                break;
+              case PROFILE_POSITION_MODE:
+                profPositionModeFired = false;
+                operatingMode = PROFILE_POSITION_MODE;
+                posRef = getEncoderPosition();
+                posPID.enablePID();
+                velPID.disablePID();
+                forcePID.disablePID();
+                digitalWrite(MAVI_LED, HIGH);
+                break;
+              case VELOCITY_MODE:
+                operatingMode = VELOCITY_MODE;
+                posPID.disablePID();
+                velRef = currentVel;
+                velPID.enablePID();
+                forcePID.disablePID();
+                break;
+              case PROFILE_VELOCITY_MODE:
+                operatingMode = PROFILE_VELOCITY_MODE;
+                //do nothing
+                break;
+              case CURRENT_MODE:
+                operatingMode = CURRENT_MODE;
+                //do nothing
+                break;
+              case HOMING_MODE:
+                operatingMode = HOMING_MODE;
+                //do nothing
+                break;
+              case FORCE_MODE:
+                operatingMode = FORCE_MODE;
+                forceRef = 0;
+                posPID.disablePID();
+                velPID.disablePID();
+                forcePID.enablePID();
+                digitalWrite(MAVI_LED, HIGH);
+                break;
+            }
+          }
+          break;
+        case COM_REL_MAX_PROF_POS_REF:    //gidebileceği maksimum hızda bağıl profil pozisyon referansı ayarlanır
+          if (serialFloatIndex == 3)
+          {
+            profPosRelRef = (long)serialFloatData[2];
+            profInitialPos = getEncoderPosition();
+            profFinalPos = profInitialPos + profPosRelRef;
+
+            profTimeInSec = sqrt(abs(profPosRelRef) / 6000.0 * 0.7);  //6000 darbe öteye 0.7 saniye tatlı geçiş, o yüzden ref
+
+            if (((abs(profPosRelRef) / 6000.0) / (profTimeInSec / 0.7) * 16070.0) > MAX_PROF_VEL) //6000 darbe 0.7 saniye için max hız 16070
+            {
+              profTimeInSec = (abs(profPosRelRef) / 6000.0) / (MAX_PROF_VEL / 0.7) * 16070;
+            }
+
+            generatePosProfile(profInitialPos, profFinalPos, profTimeInSec, coeff); //verilerden polinom katsayılarını bul
+
+            float maxComputedAccel = evalAccel(coeff, profTimeInSec / 4.73);
+
+            if (abs(maxComputedAccel) < MAX_PROF_ACCEL)
+              profPositionModeFired = true;
+            else
+            {
+              Serial.print("<");
+              Serial.print(rs485id);
+              Serial.print(" ?>");
+            }
+
+            profInitialTime = millis();
+
+          }
+          break;
+        case COM_ABS_MAX_PROF_POS_REF:
+          if (serialFloatIndex == 3)
+          {
+            profFinalPos = (long)serialFloatData[2];
+            profInitialPos = getEncoderPosition();
+            profPosRelRef = profFinalPos - profInitialPos;
+
+            profTimeInSec = sqrt(abs(profPosRelRef) / 6000.0 * 0.7);
+
+            if (((abs(profPosRelRef) / 6000.0) / (profTimeInSec / 0.7) * 16070.0) > MAX_PROF_VEL) //6000 darbe 0.7 saniye için max hız 16070
+            {
+              profTimeInSec = (abs(profPosRelRef) / 6000.0) / (MAX_PROF_VEL / 0.7) * 16070;
+            }
+
+            generatePosProfile(profInitialPos, profFinalPos, profTimeInSec, coeff);
+
+            float maxComputedAccel = evalAccel(coeff, profTimeInSec / 4.73);
+
+            if (abs(maxComputedAccel) < MAX_PROF_ACCEL)
+              profPositionModeFired = true;
+            else
+              Serial.println("?");
+
+            profInitialTime = millis();
+
+          }
+          break;
+        case COM_REL_PROF_POS_REF:
+          if (serialFloatIndex == 4)      //her komutun gerektirdiği float sayısı var. örneğin bu komut için sayı 4. ID COMMAND RELREF TIME
+          {
+            profPosRelRef = (long)serialFloatData[2];
+            profTimeInSec = serialFloatData[3];
+
+            if (profTimeInSec > 0)
+            {
+              profInitialPos = getEncoderPosition();
+              profFinalPos = profInitialPos + profPosRelRef;
+
+              generatePosProfile(profInitialPos, profFinalPos, profTimeInSec, coeff);
+
+              float maxComputedAccel = evalAccel(coeff, profTimeInSec / 4.73);
+
+              if (abs(maxComputedAccel) < MAX_PROF_ACCEL)
+                profPositionModeFired = true;
+              else
+                Serial.println("?");
+
+              profInitialTime = millis();
+
+            }
+          }
+          break;
+        case COM_ABS_PROF_POS_REF:
+          if (serialFloatIndex == 4)
+          {
+            profFinalPos = (long)serialFloatData[2];
+            profTimeInSec = serialFloatData[3];
+
+            if (profTimeInSec > 0)
+            {
+              profInitialPos = getEncoderPosition();
+
+              generatePosProfile(profInitialPos, profFinalPos, profTimeInSec, coeff);
+
+              float maxComputedAccel = evalAccel(coeff, profTimeInSec / 4.73);
+
+              if (abs(maxComputedAccel) < MAX_PROF_ACCEL)
+                profPositionModeFired = true;
+              else
+                Serial.println("?");
+
+              profInitialTime = millis();
+
+            }
+          }
+          break;
+        case COM_SET_FORCE_REF:
+          if (serialFloatIndex == 3)
+          {
+            forceRef = (int)serialFloatData[2];
+          }
+          break;
+        case COM_REL_VEL_REF:
+          if (serialFloatIndex == 3)
+          {
+            velRef += serialFloatData[2];
+          }
+          break;
+        case COM_ABS_VEL_REF:
+          if (serialFloatIndex == 3)
+          {
+            velRef = serialFloatData[2];
+          }
+          break;
+        case COM_REL_POS_REF:
+          if (serialFloatIndex == 3)
+          {
+            posRef += (long)serialFloatData[2];
+          }
+          break;
+        case COM_ABS_POS_REF:
+          if (serialFloatIndex == 3)
+          {
+            posRef = (long)serialFloatData[2];
+          }
+          break;
+        case COM_SET_POS_GAINS:
+          if (serialFloatIndex == 5)
+          {
+            posPID.setKp(serialFloatData[2]);
+            posPID.setKi(serialFloatData[3]);
+            posPID.setKd(serialFloatData[4]);
+          }
+          break;
+        case COM_SET_FORCE_GAINS:
+          if (serialFloatIndex == 5)
+          {
+            forcePID.setKp(serialFloatData[2]);
+            forcePID.setKi(serialFloatData[3]);
+            forcePID.setKd(serialFloatData[4]);
+          }
+          break;
+        case COM_SET_VEL_GAINS:
+          if (serialFloatIndex == 5)
+          {
+            velPID.setKp(serialFloatData[2]);
+            velPID.setKi(serialFloatData[3]);
+            velPID.setKd(serialFloatData[4]);
+          }
+          break;
+        case COM_PRINT_LONG_POS_REPORT:
+          if (serialFloatIndex == 2)
+          {
+            longReportPos = true;
+            longReportVel = false;
+            shortReportPos = false;
+            shortReportVel = false;
+            longReportForce = false;
+          }
+          break;
+        case COM_PRINT_LONG_FORCE_REPORT:
+          if (serialFloatIndex == 2)
+          {
+            longReportPos = false;
+            longReportVel = false;
+            shortReportPos = false;
+            shortReportVel = false;
+            longReportForce = true;
+          }
+          break;
+        case COM_PRINT_LONG_VEL_REPORT:
+          if (serialFloatIndex == 2)
+          {
+            longReportPos = false;
+            longReportVel = true;
+            shortReportPos = false;
+            shortReportVel = false;
+            longReportForce = false;
+          }
+          break;
+        case COM_PRINT_SHORT_POS_REPORT:
+          if (serialFloatIndex == 2)
+          {
+            longReportPos = false;
+            longReportVel = false;
+            shortReportPos = true;
+            shortReportVel = false;
+            longReportForce = false;
+          }
+          break;
+        case COM_PRINT_SHORT_VEL_REPORT:
+          if (serialFloatIndex == 2)
+          {
+            longReportPos = false;
+            longReportVel = false;
+            shortReportPos = false;
+            shortReportVel = true;
+            longReportForce = false;
+          }
+          break;
+        case COM_PRINT_NO_REPORT:
+          if (serialFloatIndex == 2)
+          {
+            longReportPos = false;
+            longReportVel = false;
+            shortReportPos = false;
+            shortReportVel = false;
+            longReportForce = false;
+          }
+          break;
+        case COM_SEND_DATA_FOR_MATLAB:
+          if (serialFloatIndex == 2)
+          {
+            sendLogToMatlab = true;
+          }
+          break;
+        case COM_SET_U:
+          if (serialFloatIndex == 3)
+          {
+            uManual = constrain((long)serialFloatData[2], -255, 255);
+            logEnable = true;
+          }
+          break;
+        case COM_PRINT_HELP:
+          if (serialFloatIndex == 2)
+          {
+            longReportPos = false;
+            longReportVel = false;
+            shortReportPos = false;
+            shortReportVel = false;
+            longReportForce = false;
+            print_help();
+          }
+          break;
+        case COM_GET_POSITION_LONG:
+          if (serialFloatIndex == 2)
+          {
+            unsigned long tempPos = getEncoderPosition();
+            Serial.write(tempPos);
+            Serial.write(tempPos >> 8);
+            Serial.write(tempPos >> 16);
+            Serial.write(tempPos >> 24);
+          }
+          break;
+        case COM_LOG_POSITION:
+          if (serialFloatIndex == 2)
+          {
+            logWhat = LOG_POSITION;
+          }
+          break;
+        case COM_LOG_CURRENT:
+          if (serialFloatIndex == 2)
+          {
+            logWhat = LOG_CURRENT;
+          }
+          break;
+        case COM_TEST_MOTOR_CONNECTION:
+          if (serialFloatIndex == 3)
+          {
+            longReportPos = false;
+            longReportVel = false;
+            shortReportPos = false;
+            shortReportVel = false;
+            longReportForce = false;
+            posPID.disablePID();
+            velPID.disablePID();
+            uManual = 0;
+
+            byte uTemp = constrain((long)serialFloatData[2], 0, 255);
+
+            long tempPos = getEncoderPosition();
+
+            uToPWM(uTemp);
+            delay(100);
+            uToPWM(0);
+            if ((getEncoderPosition() - tempPos) > 0)
+              Serial.println("passed");
+            else
+            {
+              if (motorDir)
+                motorDir = false;
+              else
+                motorDir = true;
+              Serial.println("First failed but corrected automatically");
+            }
+            delay(100);
+            uToPWM(uTemp);
+            delay(100);
+            uToPWM(0);
+          }
+          break;
+        case COM_GET_LOG_SIZE_INTEGER:  //Matlab log boyunu istiyor (integer tipinde uint16)
+          if (serialFloatIndex == 2)
+          {
+            Serial.write(logSize);
+            Serial.write(logSize >> 8);
+          }
+          break;
+        case COM_GET_LOOPRATE_UINT8:    //Matlab looprate'i istiyor
+          if (serialFloatIndex == 2)
+          {
+            Serial.write(loopRate);
+          }
+          break;
+        case COM_CHANGE_USER_POS_DIR:   //Kullanıcı pozitif yönü değiştirmek istiyor
+          if (serialFloatIndex == 2)
+          {
+            encoderReset();   //Enkoder mutlaka resetlenmeli
+            if (userPosDir)   //Sebebi pozisyon -1000 konumundan bir anda +1000 konumuna gelmiş olacağından.
+              userPosDir = false;
+            else
+              userPosDir = true;
+            if (motorDir)     //Pozitif u için pozitif dönüşü sağlamak üzere motor yönü de değiştirilir.
+              motorDir = false;
+            else
+              motorDir = true;
+          }
+          break;
+        case COM_SET_LOOPRATE:// birimi ms
+          if (serialFloatIndex == 3)
+          {
+            char loopRateTemp = (long)serialFloatData[2];
+            if (loopRateTemp > 0)
+              loopRate = (byte)loopRateTemp;
+          }
+          break;
+        case COM_SET_PRINTING_PERIOD: //birimi ms
+          if (serialFloatIndex == 3)
+          {
+            long printingPeriodTemp = (long)serialFloatData[2];
+            if (printingPeriodTemp > 0)
+              printingPeriod = printingPeriodTemp;
+          }
+          break;
+        case COM_RESET_ENCODER_POS:
+          if (serialFloatIndex == 2)
+          {
+            encoderReset();
+          }
+          break;
+        case COM_GET_POS_GAINS:         //Matlab posPID'nin katsayılarını istiyor (float)
+          if (serialFloatIndex == 2)
+          {
+            float tempFloat;
+            unsigned long tempHex;
+            tempFloat = posPID.getKp();
+            tempHex = *(unsigned long *)&tempFloat;
+            Serial.write((unsigned long)tempHex);
+            Serial.write(((unsigned long)tempHex) >> 8);
+            Serial.write(((unsigned long)tempHex) >> 16);
+            Serial.write(((unsigned long)tempHex) >> 24);
+            tempFloat = posPID.getKi();
+            tempHex = *(unsigned long *)&tempFloat;
+            Serial.write((unsigned long)tempHex);
+            Serial.write(((unsigned long)tempHex) >> 8);
+            Serial.write(((unsigned long)tempHex) >> 16);
+            Serial.write(((unsigned long)tempHex) >> 24);
+            tempFloat = posPID.getKd();
+            tempHex = *(unsigned long *)&tempFloat;
+            Serial.write((unsigned long)tempHex);
+            Serial.write(((unsigned long)tempHex) >> 8);
+            Serial.write(((unsigned long)tempHex) >> 16);
+            Serial.write(((unsigned long)tempHex) >> 24);
+          }
+          break;
+        case COM_GET_VEL_GAINS:            //Matlab velPID'nin katsayılarını istiyor (float)
+          if (serialFloatIndex == 2)
+          {
+            float tempFloat;
+            unsigned long tempHex;
+            tempFloat = velPID.getKp();
+            tempHex = *(unsigned long *)&tempFloat;
+            Serial.write((unsigned long)tempHex);
+            Serial.write(((unsigned long)tempHex) >> 8);
+            Serial.write(((unsigned long)tempHex) >> 16);
+            Serial.write(((unsigned long)tempHex) >> 24);
+            tempFloat = velPID.getKi();
+            tempHex = *(unsigned long *)&tempFloat;
+            Serial.write((unsigned long)tempHex);
+            Serial.write(((unsigned long)tempHex) >> 8);
+            Serial.write(((unsigned long)tempHex) >> 16);
+            Serial.write(((unsigned long)tempHex) >> 24);
+            tempFloat = velPID.getKd();
+            tempHex = *(unsigned long *)&tempFloat;
+            Serial.write((unsigned long)tempHex);
+            Serial.write(((unsigned long)tempHex) >> 8);
+            Serial.write(((unsigned long)tempHex) >> 16);
+            Serial.write(((unsigned long)tempHex) >> 24);
+          }
+          break;
+      }
+    }
+    serialFloatIndex = 0;   //bütün case'ler bakıldı ve bir sonraki seri port mesajı için
+    serialDataAvailable = 0;    //  bu değişkenler sıfırlandı
+  }
+
+}  // end of loop
+
+void print_help(void)
+{
+  Serial.println("help: Print this Help :)");
+  //  Serial.println("p: new value for Kp, e.g, p 4.2");
+  //  Serial.println("i: new value for Ki, e.g, i 0.5");
+  //  Serial.println("d: new value for Kd, e.g, d 0.7");
+  //  Serial.println("piden: enables pid computation, close the loop");
+  //  Serial.println("aref: sets new absolute pos ref");
+  //  Serial.println("relref: sets new relative pos ref");
+  //  Serial.println("piddis: disables pid computation, break the loop");
+  //  Serial.println("u: sets open loop motor Voltage as PWM duty cycle (0-255) -> (0-100)% duty");
+  //  Serial.println("long: tell the drive 'print all debug messages'");
+  //  Serial.println("short: tell the drive 'print just only current encoder pos'");
+  //  Serial.println("no: tell the drive 'don't print any debug messages'");
+  //  Serial.println("matlab: sends logged data to matlab as long int values (32bit-signed)");
+  //  Serial.println("getpos: drive sends current encoder pos as a long int value (32bit-signed)");
+}
+
+void uToPWM(float uIn)
+{
+  analogWrite(R_PWM, ((uIn < 0) ^ motorDir)*abs((int) uIn));
+  analogWrite(L_PWM, (((uIn < 0) ^ motorDir) ^ 1)*abs((int) uIn));
+}
+
+void isrForEncPinA() {  //pinChangeInterrupt için interrupt service routine'leri (isr)
+
+  encoderPosition = encoderPosition + 1 - (((PIND & B00001000) >> 2) ^ ((PIND & B00000100) >> 1));
+  //PIND D portunun pinleri, 2 ve 3 numara burada
+}
+
+void isrForEncPinB() {  //pinChangeInterrupt için interrupt service routine'leri (isr)
+
+  encoderPosition = encoderPosition - 1 + (((PIND & B00001000) >> 2) ^ ((PIND & B00000100) >> 1));
+
+}
+
+long getEncoderPosition()
+{
+  if (userPosDir)
+    return encoderPosition;
+  else
+    return 0 - encoderPosition;
+}
+
+void encoderReset()
+{
+  longReportPos = false;
+  longReportVel = false;
+  shortReportPos = false;
+  shortReportVel = false;
+  longReportForce = false;
+  posPID.disablePID();
+  velPID.disablePID();
+  uManual = 0;
+  encoderPosition = 0;
+}
+
+void generatePosProfile(long initialPos, long targetPos, float profTime, float *coeff)  //pdf'ten geldi
+{
+  coeff[0] = 12 * ((float)(targetPos - initialPos)) / (2 * pow(profTime, 5));
+  coeff[1] = -30 * ((float)(targetPos - initialPos)) / (2 * pow(profTime, 4));
+  coeff[2] = 20 * ((float)(targetPos - initialPos)) / (2 * pow(profTime, 3));
+  coeff[3] = (float) initialPos;
+}
+
+float evalPos(float *coeff, float evalTime)   //5. dereceden poz. polinomunu verilen değer için hesaplar
+{
+  return coeff[0] * pow(evalTime, 5) + coeff[1] * pow(evalTime, 4) + coeff[2] * pow(evalTime, 3) + coeff[3];
+}
+
+float evalVel(float *coeff, float evalTime)   //4. dereceden hız polinomunu verilen değer için hesaplar
+{
+  return 5.0 * coeff[0] * pow(evalTime, 4) + 4.0 * coeff[1] * pow(evalTime, 3) + 3.0 * coeff[2] * pow(evalTime, 2);
+}
+
+float evalAccel(float *coeff, float evalTime) //3. dereceden ivme polinomunu verilen değer için hesaplar
+{
+  return 20.0 * coeff[0] * pow(evalTime, 3) + 12.0 * coeff[1] * pow(evalTime, 2) + 6.0 * coeff[2] * evalTime;
+}
